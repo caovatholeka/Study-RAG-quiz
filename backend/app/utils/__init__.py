@@ -1,0 +1,19 @@
+# -*- coding: utf-8 -*-
+"""
+Utils package cho StudyRAG.
+"""
+
+from app.utils.prompts import (
+    QUIZ_GENERATION_PROMPT,
+    QUIZ_VERIFICATION_PROMPT,
+    EXPLANATION_GENERATION_PROMPT,
+    TOPIC_EXTRACTION_PROMPT,
+)
+
+__all__ = [
+    "QUIZ_GENERATION_PROMPT",
+    "QUIZ_VERIFICATION_PROMPT",
+    "EXPLANATION_GENERATION_PROMPT",
+    "TOPIC_EXTRACTION_PROMPT",
+]
+

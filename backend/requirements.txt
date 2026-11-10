@@ -1,0 +1,17 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+sqlalchemy==2.0.36
+alembic==1.14.1
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+PyMuPDF==1.25.3
+python-docx==1.1.2
+unstructured==0.16.12
+chromadb==0.6.3
+sentence-transformers==3.3.1
+google-genai==1.10.0
+rapidfuzz==3.10.1
+aiofiles==24.1.0
+httpx==0.28.1

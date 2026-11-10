@@ -1,0 +1,7 @@
+Chương 1: Giới thiệu về Trí tuệ Nhân tạo
+Trí tuệ nhân tạo (AI) là một ngành của khoa học máy tính liên quan đến việc xây dựng các máy móc thông minh có khả năng thực hiện các nhiệm vụ mà thông thường đòi hỏi trí thông minh của con người.
+Các lĩnh vực chính của AI bao gồm Học máy (Machine Learning), Xử lý ngôn ngữ tự nhiên (NLP), và Thị giác máy tính (Computer Vision).
+
+Chương 2: Xử lý Ngôn ngữ Tự nhiên
+Xử lý ngôn ngữ tự nhiên (Natural Language Processing - NLP) là một nhánh của trí tuệ nhân tạo nhằm giúp máy tính hiểu, thông dịch và tạo ra ngôn ngữ của con người một cách có giá trị.
+Các kỹ thuật phổ biến trong NLP bao gồm tách từ (tokenization), gán nhãn từ loại (POS tagging), và mô hình ngôn ngữ lớn (LLM).
