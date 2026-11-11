@@ -40,13 +40,32 @@ class StructureExtractor:
         re.compile(r"^(?:Phần|PHẦN|Part)\s+(\d+|[IVXLCDM]+)[.:\s]", re.IGNORECASE),
     ]
 
-    # Regex nhận diện Mục/Tiết (Level 2 & 3)
+    # Regex nhận diện Mục/Tiết (Level 2)
     SECTION_PATTERNS = [
-        re.compile(r"^(\d+\.)\s+"),
         re.compile(r"^(\d+\.\d+\.?)\s+"),
         re.compile(r"^([IVXLCDM]+\.)\s+"),
-        re.compile(r"^([a-z][.\)])\s+", re.IGNORECASE),
+        re.compile(r"^(?:Mục|Tiết|Chủ đề|Topic)\s+(\d+|[IVXLCDM]+)(?:[.:\s]|$)", re.IGNORECASE),
+        re.compile(r"^(\d+\.)\s+"),
     ]
+
+    # Regex nhận diện Tiểu mục (Level 3)
+    SUBSECTION_PATTERNS = [
+        re.compile(r"^(\d+\.\d+\.\d+\.?)\s+"),
+        re.compile(r"^([a-z]\))\s+"),
+    ]
+
+    # Regex nhận diện phương án trắc nghiệm (A. B. C. D. hoặc a. b. c. d.) - KHÔNG PHẢI HEADING
+    QUIZ_OPTION_PATTERN = re.compile(r"^[A-Da-d][.\)]\s+")
+
+    # Regex nhận diện bullet points
+    BULLET_PATTERN = re.compile(r"^[\u2022\u2023\u25E6\u2043\u2219\u25AA\u25AB\u25CF\u25CB\u2192\u2794\uF0E0\-\*\+]\s*")
+
+    # Banner hoạt động trong slide
+    GENERIC_BANNERS = {
+        "câu hỏi trắc nghiệm", "trắc nghiệm", "thảo luận", "bài tập", "ví dụ",
+        "lưu ý", "tình huống khởi động", "cấu trúc nội dung", "tài liệu học tập",
+        "mục tiêu", "tổng kết"
+    }
 
     # Danh sách từ dừng (Stopwords) tiếng Việt và tiếng Anh để lọc khi trích xuất topic labels
     STOPWORDS = {
@@ -76,7 +95,10 @@ class StructureExtractor:
         # 1. Dựng cây phân cấp từ danh sách khối văn bản
         tree = self._build_tree(blocks, parsed_doc.metadata)
 
-        # 2. Nếu không dựng được cây nào (không có heading) -> Fallback
+        # 2. Làm sạch và tối ưu hóa cây phân cấp (gộp tiêu đề root rỗng)
+        tree = self._consolidate_tree(tree)
+
+        # 3. Nếu không dựng được cây nào (không có heading) -> Fallback
         if not tree:
             logger.info("Không phát hiện được heading nào. Kích hoạt Fallback thành 1 chương duy nhất.")
             return self._fallback_single_chapter(parsed_doc)
@@ -88,13 +110,30 @@ class StructureExtractor:
         logger.info(f"Trích xuất thành công {len(tree)} chương gốc.")
         return tree
 
+    def _is_banner(self, text: str) -> bool:
+        """Kiểm tra có phải là banner slide hoạt động thông thường (câu hỏi trắc nghiệm, thảo luận...)."""
+        clean = re.sub(r"^[0-9.:\s\-•]+", "", text.lower()).strip()
+        return (
+            clean in self.GENERIC_BANNERS
+            or clean.startswith("câu hỏi trắc nghiệm")
+            or clean.startswith("thảo luận")
+        )
+
     def _detect_heading_level(self, block: TextBlock) -> Optional[int]:
         """
         Xác định cấp độ heading (1: chapter, 2: section, 3: subsection) hoặc None.
         Kết hợp thông tin block.heading_level và regex matching trên nội dung.
         """
         text = block.text.strip()
-        if not text:
+        if not text or len(text) < 2:
+            return None
+
+        # 0. Loại trừ tuyệt đối: Quiz options, Bullets, và Slide Banners
+        if self.QUIZ_OPTION_PATTERN.match(text) or self.BULLET_PATTERN.match(text) or self._is_banner(text):
+            return None
+
+        # Loại trừ câu hỏi hoặc vế câu dở dang
+        if (text.endswith("?") or text.endswith(":") or text.endswith(";") or text.endswith(",")) and not any(p.search(text) for p in self.CHAPTER_PATTERNS):
             return None
 
         # 1. Kiểm tra CHAPTER_PATTERNS -> Level 1
@@ -102,14 +141,21 @@ class StructureExtractor:
             if pattern.search(text):
                 return 1
 
-        # 2. Kiểm tra SECTION_PATTERNS
-        # Kiểm tra tiểu mục (ví dụ "1.1.1", "a)", "a.") -> Level 3
-        if re.search(r"^(\d+\.\d+\.\d+\.?)\s+", text) or re.search(r"^([a-z][.\)])\s+", text, re.IGNORECASE):
-            return 3
+        # 2. Kiểm tra tiểu mục (ví dụ "1.1.1", "a)") -> Level 3
+        for pattern in self.SUBSECTION_PATTERNS:
+            if pattern.search(text):
+                return 3
 
-        # Kiểm tra mục cấp 2 (ví dụ "1.1", "1.1.", "1.", "I.") -> Level 2
+        # Kiểm tra mục cấp 2 (ví dụ "1.1", "1.1.", "I.", "1.") -> Level 2
         for pattern in self.SECTION_PATTERNS:
             if pattern.search(text):
+                # Nếu là single number 1. ABC: loại trừ câu hỏi hoặc plain body text
+                if re.match(r"^\d+\.\s+", text):
+                    lower = text.lower()
+                    if any(w in lower for w in ["gì", "nào", "sao", "không", "ai", "đâu"]):
+                        continue
+                    if not (block.is_bold or (len(text) > 3 and text[2:4].strip().isupper())):
+                        continue
                 return 2
 
         # 3. Dựa trên thông tin typography đã được parser gắn cờ
@@ -142,6 +188,23 @@ class StructureExtractor:
             if level is not None:
                 title = block.text.strip()
                 extracted_num = self._extract_number_from_title(title)
+
+                # Deduplication: gộp tiêu đề giống nhau liên tiếp trên các trang/slide
+                norm_title = re.sub(r"\s+", " ", title.strip().lower())
+                if current_node and re.sub(r"\s+", " ", current_node.title.strip().lower()) == norm_title:
+                    if block.page_number is not None:
+                        current_node.page_end = block.page_number
+                    continue
+                if current_section and re.sub(r"\s+", " ", current_section.title.strip().lower()) == norm_title:
+                    current_node = current_section
+                    if block.page_number is not None:
+                        current_section.page_end = block.page_number
+                    continue
+                if current_chapter and re.sub(r"\s+", " ", current_chapter.title.strip().lower()) == norm_title:
+                    current_node = current_chapter
+                    if block.page_number is not None:
+                        current_chapter.page_end = block.page_number
+                    continue
 
                 if level == 1:
                     num = extracted_num if extracted_num is not None else chapter_counter
@@ -258,6 +321,35 @@ class StructureExtractor:
             return []
 
         return roots
+
+    def _consolidate_tree(self, roots: List[ChapterNode]) -> List[ChapterNode]:
+        """
+        Làm sạch cây phân cấp:
+        1. Gộp các root chapter rỗng liên tiếp (ví dụ slide 1 'QUẢN TRỊ HỌC' (0 ký tự), slide 2 'CHƯƠNG 1' (0 ký tự) -> gộp vào 'CHƯƠNG 1: TỔNG QUAN VỀ QUẢN TRỊ HỌC').
+        """
+        if not roots:
+            return roots
+
+        consolidated: List[ChapterNode] = []
+        pending_titles: List[str] = []
+
+        for node in roots:
+            # Chỉ gộp nếu node hoàn toàn không có nội dung và không có children
+            if not node.children and not node.content.strip():
+                pending_titles.append(node.title)
+            else:
+                if pending_titles:
+                    prefix = " - ".join(pending_titles)
+                    if not any(node.title.lower().startswith(p.lower()) for p in pending_titles):
+                        node.title = f"{prefix}: {node.title}"
+                    pending_titles = []
+                consolidated.append(node)
+
+        # Nếu toàn bộ root nodes đều rỗng, giữ lại roots ban đầu
+        if not consolidated and roots:
+            return roots
+
+        return consolidated
 
     def _create_intro_chapter(self, blocks: List[TextBlock]) -> ChapterNode:
         """Tạo chương mở đầu cho các khối văn bản xuất hiện trước chương 1."""

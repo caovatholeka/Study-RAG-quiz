@@ -13,6 +13,10 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.database import Base, engine
+from app.logging_config import setup_logging, get_recent_logs, LOG_FILE
+
+# Cấu hình file log ngay khi server khởi động
+setup_logging()
 
 
 @asynccontextmanager
@@ -69,6 +73,22 @@ async def root():
             "documents": "/api/documents",
             "chapters": "/api/chapters",
             "quiz": "/api/quiz",
+            "check_key": "/api/quiz/check-key",
+            "logs": "/api/logs",
         },
+    }
+
+
+@app.get("/api/logs", tags=["Logs"])
+async def get_logs(lines: int = 100):
+    """
+    Xem log hệ thống gần nhất theo thời gian thực.
+    Hữu ích để theo dõi tiến trình upload tài liệu, chunking, embedding, và sinh câu hỏi.
+    """
+    recent = get_recent_logs(lines=lines)
+    return {
+        "log_file": str(LOG_FILE),
+        "total_lines": len(recent),
+        "logs": recent,
     }
 

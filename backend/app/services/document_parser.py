@@ -49,22 +49,33 @@ class DocumentParser:
     # Regex patterns mục lớn (Level 2)
     SECTION_PATTERNS = [
         re.compile(r"^(\d+\.\d+\.?)\s+"),
-        re.compile(r"^(\d+\.)\s+"),
         re.compile(r"^([IVXLCDM]+\.)\s+"),
+        re.compile(r"^(?:Mục|Tiết|Chủ đề|Topic)\s+(\d+|[IVXLCDM]+)(?:[.:\s]|$)", re.IGNORECASE),
+        re.compile(r"^(\d+\.)\s+"),
     ]
 
     # Regex patterns tiểu mục (Level 3)
     SUBSECTION_PATTERNS = [
         re.compile(r"^(\d+\.\d+\.\d+\.?)\s+"),
-        re.compile(r"^([a-z][.\)])\s+", re.IGNORECASE),
+        re.compile(r"^([a-z]\))\s+"),
     ]
 
-    # Regex nhận diện list item
+    # Regex nhận diện phương án trắc nghiệm (A. B. C. D. hoặc a. b. c. d.) - KHÔNG BAO GIỜ LÀ HEADING
+    QUIZ_OPTION_PATTERN = re.compile(r"^[A-Da-d][.\)]\s+")
+
+    # Regex nhận diện list item và bullet points
     LIST_PATTERNS = [
-        re.compile(r"^[\u2022\u2023\u25E6\u2043\u2219\-\*\+]\s+"),
+        re.compile(r"^[\u2022\u2023\u25E6\u2043\u2219\u25AA\u25AB\u25CF\u25CB\u2192\u2794\uF0E0\-\*\+]\s*"),
         re.compile(r"^\(\d+\)\s+"),
         re.compile(r"^\d+\)\s+"),
     ]
+
+    # Danh sách các tiêu đề banner/hoạt động trong slide - không coi là chương/mục lớn để tránh phân mảnh tài liệu
+    GENERIC_BANNERS = {
+        "câu hỏi trắc nghiệm", "trắc nghiệm", "thảo luận", "bài tập", "ví dụ",
+        "lưu ý", "tình huống khởi động", "cấu trúc nội dung", "tài liệu học tập",
+        "mục tiêu", "tổng kết"
+    }
 
     def parse(self, file_path: str, file_type: str) -> ParsedDocument:
         """
@@ -146,9 +157,13 @@ class DocumentParser:
         logger.debug(f"PDF median font size: {median_font_size:.2f}")
 
         # Xác định header/footer lặp lại (xuất hiện >= 2 trang nếu total_pages >= 2)
+        # LƯU Ý: Không được coi các heading cấu trúc (Chương, 1.1, 1.2...) là artifact cần xóa,
+        # vì trong bài giảng/slide, cùng một tiêu đề mục xuất hiện trên nhiều slide liên tiếp là bình thường!
         repeated_artifacts: Set[str] = set()
         if total_pages >= 2:
             for text, pages in {**top_candidates, **bottom_candidates}.items():
+                if self._match_regex_heading(text) is not None:
+                    continue
                 if len(pages) >= 2:
                     repeated_artifacts.add(text)
 
@@ -464,51 +479,80 @@ class DocumentParser:
     # HELPER METHODS
     # =========================================================================
 
+    def _is_banner(self, text: str) -> bool:
+        """Kiểm tra có phải là banner slide hoạt động thông thường (câu hỏi trắc nghiệm, thảo luận...)."""
+        clean = re.sub(r"^[0-9.:\s\-•]+", "", text.lower()).strip()
+        return (
+            clean in self.GENERIC_BANNERS
+            or clean.startswith("câu hỏi trắc nghiệm")
+            or clean.startswith("thảo luận")
+        )
+
     def _classify_heading(
         self, text: str, font_size: float, median_font_size: float, is_bold: bool
     ) -> Optional[int]:
         """Phân loại mức độ heading (1, 2, 3) dựa trên regex và font characteristics."""
+        trimmed = text.strip()
+        if not trimmed or len(trimmed) < 2:
+            return None
+
+        # 0. Loại trừ tuyệt đối: bullet items, quiz options (A., B., C., D.), và slide banners
+        if self._is_list_item(trimmed) or self.QUIZ_OPTION_PATTERN.match(trimmed) or self._is_banner(trimmed):
+            return None
+
+        # Loại trừ câu hỏi hoặc vế câu dở dang kết thúc bằng dấu ?, :, ;, , (trừ khi có từ khóa Chương/Bài)
+        if trimmed.endswith("?") or trimmed.endswith(":") or trimmed.endswith(";") or trimmed.endswith(","):
+            if not any(p.search(trimmed) for p in self.CHAPTER_PATTERNS):
+                return None
+
         # 1. Ưu tiên regex patterns rõ ràng
-        regex_lvl = self._match_regex_heading(text)
+        regex_lvl = self._match_regex_heading(trimmed)
         if regex_lvl is not None:
+            # Nếu chỉ là dạng "1. ABC", kiểm tra thêm: phải viết hoa chữ đầu hoặc in đậm
+            if re.match(r"^\d+\.\s+", trimmed) and not (is_bold or (len(trimmed) > 3 and trimmed[2:4].strip().isupper())):
+                return None
             return regex_lvl
 
-        # 2. Heading khi font_size > median_font_size * 1.2 AND is_bold
-        if font_size > median_font_size * 1.2 and is_bold and len(text) < 160:
-            if font_size >= median_font_size * 1.5:
+        # 2. Heading khi font_size > median_font_size * 1.25 AND is_bold AND len < 120
+        if font_size > median_font_size * 1.25 and is_bold and len(trimmed) < 120:
+            if font_size >= median_font_size * 1.6:
                 return 1
-            elif font_size >= median_font_size * 1.3:
+            elif font_size >= median_font_size * 1.35:
                 return 2
             else:
                 return 3
 
-        # 3. Tiêu đề có font size rất lớn (>= median * 1.4) và độ dài ngắn
-        if font_size >= median_font_size * 1.4 and len(text) < 160 and not text.endswith("."):
-            return 1 if font_size >= median_font_size * 1.6 else 2
-
-        # 4. Tiêu đề in hoa toàn bộ và in đậm
-        if is_bold and text.isupper() and 4 < len(text) < 120 and any(c.isalpha() for c in text):
-            return 1 if font_size > median_font_size else 2
+        # 3. Tiêu đề in hoa toàn bộ (All-caps) và in đậm hoặc font lớn
+        if trimmed.isupper() and 4 < len(trimmed) < 100 and any(c.isalpha() for c in trimmed):
+            if is_bold or font_size >= median_font_size * 1.2:
+                return 1 if font_size > median_font_size * 1.3 else 2
 
         return None
 
     def _match_regex_heading(self, text: str) -> Optional[int]:
         """Khớp regex patterns tiếng Việt/tiếng Anh để xác định heading level (1, 2, 3)."""
         trimmed = text.strip()
+        if self._is_banner(trimmed):
+            return None
 
         # Check Level 1: Chương, Bài, Phần
         for pattern in self.CHAPTER_PATTERNS:
             if pattern.search(trimmed):
                 return 1
 
-        # Check Level 3: Tiểu mục (1.1.1, a), a.)
+        # Check Level 3: Tiểu mục (1.1.1, a))
         for pattern in self.SUBSECTION_PATTERNS:
             if pattern.search(trimmed):
                 return 3
 
-        # Check Level 2: Mục (1., 1.1, I., II.)
+        # Check Level 2: Mục (1.1, I., II., 1.)
         for pattern in self.SECTION_PATTERNS:
             if pattern.search(trimmed):
+                # Nếu là single number 1. ABC: loại trừ câu hỏi/thảo luận
+                if re.match(r"^\d+\.\s+", trimmed):
+                    lower = trimmed.lower()
+                    if any(w in lower for w in ["gì", "nào", "sao", "không", "ai", "đâu", "chỗ nào", "thế nào"]):
+                        continue
                 return 2
 
         return None

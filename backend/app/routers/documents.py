@@ -3,6 +3,7 @@
 Router cho quản lý tài liệu: upload, list, detail, delete.
 """
 
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
@@ -12,12 +13,15 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
+from app.logging_config import get_recent_logs, LOG_FILE
 from app.models.document import Document, DocumentStatus
 from app.schemas.document import (
     DocumentUploadResponse,
     DocumentResponse,
     DocumentListResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
 
@@ -38,18 +42,22 @@ def _process_document_background(document_id: int):
     from app.database import SessionLocal
     from app.services.document_processor import DocumentProcessor
 
+    logger.info(f"🚀 [BACKGROUND] Bắt đầu pipeline xử lý tài liệu ID={document_id}...")
     db = SessionLocal()
     try:
         processor = DocumentProcessor()
         processor.process_document(document_id, db)
+        logger.info(f"🏁 [BACKGROUND] Hoàn tất pipeline xử lý tài liệu ID={document_id} thành công!")
     except Exception as e:
-        # Cập nhật status thành error
-        doc = db.query(Document).filter(Document.id == document_id).first()
-        if doc:
-            doc.status = DocumentStatus.ERROR
-            db.commit()
-        import logging
-        logging.getLogger(__name__).error(f"Error processing document {document_id}: {e}")
+        logger.error(f"❌ [BACKGROUND] Lỗi khi xử lý tài liệu ID={document_id}: {e}", exc_info=True)
+        try:
+            db.rollback()
+            doc = db.query(Document).filter(Document.id == document_id).first()
+            if doc:
+                doc.status = DocumentStatus.ERROR
+                db.commit()
+        except Exception as rollback_err:
+            logger.error(f"❌ [BACKGROUND] Lỗi khi rollback cho tài liệu ID={document_id}: {rollback_err}")
     finally:
         db.close()
 
@@ -64,9 +72,12 @@ async def upload_document(
     Upload tài liệu học tập (PDF, DOCX, TXT).
     File sẽ được lưu và xử lý trong background.
     """
+    logger.info(f"📥 [UPLOAD] Tiếp nhận file upload: '{file.filename}'...")
+
     # Validate file extension
     ext = _get_file_extension(file.filename)
     if ext not in ALLOWED_EXTENSIONS:
+        logger.warning(f"⚠️ [UPLOAD] Định dạng file không được hỗ trợ: '{ext}' ({file.filename})")
         raise HTTPException(
             status_code=400,
             detail=f"Định dạng file không được hỗ trợ: {ext}. "
@@ -83,6 +94,8 @@ async def upload_document(
     with open(file_path, "wb") as f:
         f.write(content)
 
+    logger.info(f"💾 [UPLOAD] Đã lưu file vào đĩa: {file_path} ({len(content):,} bytes)")
+
     # Tạo record trong DB
     document = Document(
         filename=unique_filename,
@@ -95,6 +108,10 @@ async def upload_document(
     db.commit()
     db.refresh(document)
 
+    logger.info(
+        f"✅ [UPLOAD] Đã tạo Document ID={document.id} ('{document.original_filename}'). Chuyển sang xử lý nền..."
+    )
+
     # Trigger background processing
     background_tasks.add_task(_process_document_background, document.id)
 
@@ -106,6 +123,17 @@ async def upload_document(
         file_type=document.file_type,
         message="Tài liệu đã được upload và đang được xử lý.",
     )
+
+
+@router.get("/logs", tags=["Documents"])
+async def get_document_logs(lines: int = 100):
+    """Xem log hệ thống gần nhất theo thời gian thực."""
+    logs = get_recent_logs(lines=lines)
+    return {
+        "log_file": str(LOG_FILE),
+        "lines_count": len(logs),
+        "logs": logs,
+    }
 
 
 @router.get("/", response_model=DocumentListResponse)

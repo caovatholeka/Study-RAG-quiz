@@ -10,6 +10,7 @@ Quản lý:
 
 import logging
 import random
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
@@ -312,6 +313,8 @@ class QuizService:
         db: Session,
         quiz_generator: QuizGenerator,
         quiz_verifier: QuizVerifier,
+        num_questions_per_chapter: Optional[int] = None,
+        progress_callback: Optional[Any] = None,
     ) -> int:
         """
         Duyệt qua tất cả các chương của tài liệu, sinh câu hỏi bằng QuizGenerator,
@@ -322,11 +325,15 @@ class QuizService:
             db: Database session.
             quiz_generator: Instance của QuizGenerator.
             quiz_verifier: Instance của QuizVerifier.
+            num_questions_per_chapter: Số câu hỏi mỗi chương (mặc định lấy từ cấu hình).
+            progress_callback: Hàm callback cập nhật thông điệp tiến trình (nếu có).
 
         Returns:
             int: Tổng số câu hỏi đã được tạo và lưu trữ.
         """
         logger.info(f"Bắt đầu quy trình generate quiz cho document_id={document_id}...")
+        if progress_callback:
+            progress_callback("Đang nạp danh sách chương mục từ cơ sở dữ liệu...")
 
         document = db.query(Document).filter(Document.id == document_id).first()
         if not document:
@@ -344,27 +351,43 @@ class QuizService:
             logger.warning(f"Tài liệu ID={document_id} không có chương nào để tạo quiz.")
             return 0
 
+        valid_chapters = [c for c in chapters if len((c.content or "").strip()) >= 50]
+        if not valid_chapters:
+            logger.warning(f"Tài liệu ID={document_id} không có chương nào đủ nội dung để tạo quiz.")
+            return 0
+
         total_saved_questions = 0
-        max_per_ch = getattr(settings, "MAX_QUESTIONS_PER_CHAPTER", 15)
+        total_target = num_questions_per_chapter  # Mục tiêu tổng số câu cho toàn bộ tài liệu (nếu có)
 
-        for chapter in chapters:
+        for idx, chapter in enumerate(valid_chapters):
+            if total_target is not None and total_saved_questions >= total_target:
+                break
+
             content = (chapter.content or "").strip()
-            if len(content) < 50:
-                logger.info(
-                    f"Bỏ qua chương #{chapter.chapter_number} '{chapter.title}': Nội dung quá ngắn ({len(content)} ký tự)."
-                )
-                continue
 
-            logger.info(
-                f"Đang sinh câu hỏi cho chương #{chapter.chapter_number}: '{chapter.title}' (ID {chapter.id})..."
+            # Tính số câu hỏi cần sinh cho chương này
+            if total_target is not None:
+                remaining_needed = total_target - total_saved_questions
+                remaining_chapters = len(valid_chapters) - idx
+                num_to_gen = max(1, (remaining_needed + remaining_chapters - 1) // remaining_chapters)
+                num_to_gen = min(num_to_gen, remaining_needed)
+            else:
+                num_to_gen = getattr(settings, "MAX_QUESTIONS_PER_CHAPTER", 15)
+
+            msg = (
+                f"Đang sinh {num_to_gen} câu hỏi cho chương #{chapter.chapter_number}: '{chapter.title}' "
+                f"(Đã lưu {total_saved_questions}/{total_target or 'toàn bộ'})..."
             )
+            logger.info(msg)
+            if progress_callback:
+                progress_callback(msg)
 
             try:
-                # 1. Sinh câu hỏi bằng Gemini
+                # 1. Sinh câu hỏi bằng AI
                 raw_questions = quiz_generator.generate_questions(
                     chapter_title=chapter.title,
                     chapter_content=content,
-                    num_questions=max_per_ch,
+                    num_questions=num_to_gen,
                 )
 
                 if not raw_questions:
@@ -372,11 +395,19 @@ class QuizService:
                     continue
 
                 # 2. Xác thực bằng pipeline 3 bước (RAG -> Fuzzy -> LLM)
+                if progress_callback:
+                    progress_callback(f"Đang kiểm định {len(raw_questions)} câu hỏi của chương '{chapter.title}'...")
+
                 verified_questions = quiz_verifier.verify_questions(
                     questions=raw_questions,
                     chapter_id=chapter.id,
                     document_id=document_id,
                 )
+
+                # Giới hạn không vượt quá target nếu có
+                if total_target is not None:
+                    allowed_count = max(0, total_target - total_saved_questions)
+                    verified_questions = verified_questions[:allowed_count]
 
                 # 3. Lưu vào database
                 for q_dict in verified_questions:
@@ -405,6 +436,11 @@ class QuizService:
                 logger.info(
                     f"Đã lưu thành công {len(verified_questions)} câu hỏi cho chương ID {chapter.id}."
                 )
+                if progress_callback:
+                    progress_callback(f"Đã lưu {len(verified_questions)} câu hỏi cho chương #{chapter.chapter_number}.")
+
+                # Giãn cách 1 giây để an toàn cho rate limit
+                time.sleep(1.0)
 
             except Exception as e:
                 db.rollback()
@@ -413,8 +449,10 @@ class QuizService:
                     exc_info=True,
                 )
 
-        logger.info(
-            f"Hoàn thành generate quiz cho document_id={document_id}. Tổng số câu hỏi: {total_saved_questions}."
-        )
+        final_msg = f"Hoàn thành generate quiz cho document_id={document_id}. Tổng số câu hỏi mới lưu: {total_saved_questions}."
+        logger.info(final_msg)
+        if progress_callback:
+            progress_callback(final_msg)
+
         return total_saved_questions
 

@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import { getDocument } from '../api/documents';
 import { getChapters } from '../api/chapters';
-import { generateQuiz, startQuiz } from '../api/quiz';
+import { generateQuiz, startQuiz, getQuizStats, type QuizStatsResponse } from '../api/quiz';
 import type { DocumentItem, ChapterItem } from '../types';
 import ChapterTree from '../components/ChapterTree';
 import LoadingSpinner from '../components/LoadingSpinner';
@@ -26,8 +26,9 @@ export const DocumentPage: React.FC = () => {
   const [loading, setLoading] = useState<boolean>(true);
   const [generating, setGenerating] = useState<boolean>(false);
   const [startingQuiz, setStartingQuiz] = useState<boolean>(false);
-  const [numQuestions, setNumQuestions] = useState<number>(10);
+  const [numQuestions, setNumQuestions] = useState<number>(5);
   const [quizMode, setQuizMode] = useState<string>('chapter');
+  const [quizStats, setQuizStats] = useState<QuizStatsResponse | null>(null);
 
   const [feedback, setFeedback] = useState<{
     type: 'success' | 'error' | 'info';
@@ -38,12 +39,19 @@ export const DocumentPage: React.FC = () => {
     if (!id) return;
     setLoading(true);
     try {
-      const [docData, chapData] = await Promise.all([
+      const [docData, chapData, statsData] = await Promise.all([
         getDocument(id),
         getChapters(id),
+        getQuizStats(id).catch(() => null),
       ]);
       setDocument(docData);
       setChapters(chapData.chapters || []);
+      if (statsData) {
+        setQuizStats(statsData);
+        if (statsData.is_generating) {
+          setGenerating(true);
+        }
+      }
 
       // Default select all chapters
       const extractIds = (items: ChapterItem[]): number[] => {
@@ -71,6 +79,29 @@ export const DocumentPage: React.FC = () => {
     fetchData();
   }, [fetchData]);
 
+  // Polling tiến trình sinh câu hỏi nền (kể cả khi chuyển tab rồi quay lại)
+  useEffect(() => {
+    if (!id || !generating) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const stats = await getQuizStats(id);
+        setQuizStats(stats);
+        if (!stats.is_generating) {
+          setGenerating(false);
+          setFeedback({
+            type: 'success',
+            message: `Hoàn tất! Ngân hàng câu hỏi hiện có ${stats.total_questions} câu hỏi được lưu trong CSDL SQLite. Bạn có thể bắt đầu làm bài ngay!`,
+          });
+        }
+      } catch (err) {
+        console.error('Lỗi polling quiz stats:', err);
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [id, generating]);
+
   const handleToggleSelect = (chapterId: number) => {
     setSelectedChapterIds((prev) =>
       prev.includes(chapterId)
@@ -92,11 +123,14 @@ export const DocumentPage: React.FC = () => {
     setGenerating(true);
     setFeedback(null);
     try {
-      const res = await generateQuiz(id);
+      // Gửi đúng số lượng câu hỏi numQuestions được chọn lên backend
+      const res = await generateQuiz(id, numQuestions);
       setFeedback({
-        type: 'success',
-        message: res.message || 'Hệ thống AI đang tạo câu hỏi trắc nghiệm trong background. Bạn có thể bấm Bắt đầu ôn tập sau ít phút!',
+        type: 'info',
+        message: res.message || `Hệ thống AI đang bắt đầu sinh ${numQuestions} câu hỏi cho tài liệu trong background...`,
       });
+      const stats = await getQuizStats(id);
+      setQuizStats(stats);
     } catch (err: any) {
       const msg =
         err.response?.data?.detail ||
@@ -105,7 +139,6 @@ export const DocumentPage: React.FC = () => {
         type: 'error',
         message: typeof msg === 'string' ? msg : JSON.stringify(msg),
       });
-    } finally {
       setGenerating(false);
     }
   };
@@ -210,7 +243,7 @@ export const DocumentPage: React.FC = () => {
               className="flex items-center space-x-1.5 px-4 py-2.5 rounded-xl border border-blue-200 bg-blue-50 hover:bg-blue-100 text-blue-700 text-xs font-bold transition-all shadow-xs disabled:opacity-50"
             >
               <Sparkles className={`w-4 h-4 ${generating ? 'animate-spin' : ''}`} />
-              <span>{generating ? 'Đang tạo câu hỏi...' : 'Tạo câu hỏi bằng AI'}</span>
+              <span>{generating ? 'Đang tạo câu hỏi...' : `Tạo ${numQuestions} câu hỏi bằng AI`}</span>
             </button>
 
             <button
@@ -220,10 +253,81 @@ export const DocumentPage: React.FC = () => {
               className="flex items-center space-x-1.5 px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white text-xs font-bold transition-all shadow-md shadow-blue-500/20"
             >
               <Play className="w-4 h-4 fill-white" />
-              <span>{startingQuiz ? 'Đang khởi tạo...' : 'Bắt đầu ôn tập'}</span>
+              <span>
+                {startingQuiz
+                  ? 'Đang khởi tạo...'
+                  : `Bắt đầu ôn tập (${quizStats?.total_questions || 0} câu có sẵn)`}
+              </span>
             </button>
           </div>
         </div>
+      </div>
+
+      {/* Banner Trạng thái Ngân hàng Câu hỏi & Tiến trình Sinh câu hỏi */}
+      <div className="bg-white rounded-3xl border border-slate-200 p-5 shadow-xs">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex items-center space-x-3.5">
+            <div
+              className={`w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 ${
+                generating
+                  ? 'bg-blue-100 text-blue-600 animate-pulse'
+                  : (quizStats?.total_questions || 0) > 0
+                  ? 'bg-emerald-100 text-emerald-700'
+                  : 'bg-amber-100 text-amber-700'
+              }`}
+            >
+              {generating ? (
+                <Sparkles className="w-6 h-6 animate-spin" />
+              ) : (quizStats?.total_questions || 0) > 0 ? (
+                <CheckCircle2 className="w-6 h-6 text-emerald-600" />
+              ) : (
+                <AlertCircle className="w-6 h-6 text-amber-600" />
+              )}
+            </div>
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-base font-bold text-slate-800">
+                  Ngân hàng câu hỏi trắc nghiệm
+                </h2>
+                <span className="text-[11px] px-2.5 py-0.5 rounded-full font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                  Đã lưu trong CSDL SQLite
+                </span>
+              </div>
+              <p className="text-xs text-slate-500 mt-1">
+                {generating
+                  ? (quizStats?.progress_message || 'AI đang sinh và xác thực câu hỏi theo tài liệu...')
+                  : (quizStats?.total_questions || 0) > 0
+                  ? `Đã lưu vĩnh viễn ${quizStats?.total_questions} câu hỏi vào CSDL. Mở lại ứng dụng sau này vẫn còn nguyên 100%.`
+                  : 'Tài liệu này chưa có câu hỏi nào trong CSDL. Bạn hãy nhấn nút "Tạo câu hỏi bằng AI" để AI sinh bộ đề.'}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center space-x-3 self-end sm:self-center">
+            <div className="text-right">
+              <span className="text-2xl font-black text-blue-600 block leading-tight">
+                {quizStats?.total_questions || 0}
+              </span>
+              <span className="text-[11px] text-slate-400 font-medium">câu hỏi sẵn sàng</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Thanh tiến trình chạy trực tiếp khi đang sinh câu hỏi */}
+        {generating && (
+          <div className="mt-4 pt-3 border-t border-slate-100 space-y-2">
+            <div className="flex items-center justify-between text-xs text-blue-700 font-semibold">
+              <span className="flex items-center space-x-1.5">
+                <span className="w-2 h-2 rounded-full bg-blue-600 animate-ping" />
+                <span>{quizStats?.progress_message || 'Đang tạo câu hỏi trong background...'}</span>
+              </span>
+              <span>Đang lưu vào CSDL...</span>
+            </div>
+            <div className="w-full bg-blue-50 h-2.5 rounded-full overflow-hidden border border-blue-100">
+              <div className="bg-gradient-to-r from-blue-500 to-indigo-600 h-full rounded-full animate-pulse w-4/5 transition-all duration-700" />
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Notifications */}
@@ -335,12 +439,22 @@ export const DocumentPage: React.FC = () => {
 
             <button
               type="button"
-              disabled={startingQuiz || selectedChapterIds.length === 0}
+              disabled={
+                startingQuiz ||
+                selectedChapterIds.length === 0 ||
+                (quizStats?.total_questions || 0) === 0
+              }
               onClick={handleStartQuiz}
               className="w-full py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white rounded-xl text-xs font-bold flex items-center justify-center space-x-2 shadow-sm transition-all"
             >
               <Play className="w-4 h-4 fill-white" />
-              <span>{startingQuiz ? 'Đang chuẩn bị đề...' : 'Bắt đầu làm bài ngay'}</span>
+              <span>
+                {startingQuiz
+                  ? 'Đang chuẩn bị đề...'
+                  : (quizStats?.total_questions || 0) === 0
+                  ? 'Chưa có câu hỏi (Hãy tạo bằng AI trước)'
+                  : `Bắt đầu làm bài (${Math.min(numQuestions, quizStats?.total_questions || 0)}/${numQuestions} câu)`}
+              </span>
             </button>
           </div>
         </div>

@@ -62,31 +62,44 @@ class DocumentProcessor:
             db.refresh(document)
 
             # 2. Parse file theo định dạng
-            logger.info(f"Parsing file: {document.file_path} (loại: {document.file_type})")
+            logger.info(f"📄 [1/4 PARSER] Bắt đầu đọc file: {document.file_path} (loại: {document.file_type})")
             parsed_doc = self.parser.parse(document.file_path, document.file_type)
+            page_info = f"{parsed_doc.metadata.get('total_pages', 1)} trang" if document.file_type == 'pdf' else 'file văn bản'
+            total_extracted_text = sum(len(b.text.strip()) for b in parsed_doc.blocks)
+            logger.info(
+                f"📄 [1/4 PARSER] Hoàn tất trích xuất: {len(parsed_doc.blocks)} khối văn bản ({total_extracted_text:,} ký tự) từ {page_info}."
+            )
+
+            if not parsed_doc.blocks or total_extracted_text == 0:
+                err_msg = (
+                    f"Tài liệu '{document.original_filename}' không chứa lớp văn bản điện tử nào (0 ký tự từ {page_info}). "
+                    "Đây là file PDF scan / chụp ảnh hoàn toàn. Vui lòng sử dụng file PDF có text layer (bôi đen chữ được) "
+                    "hoặc chuyển đổi OCR thành file Word/PDF trước khi tải lên."
+                )
+                logger.error(f"❌ [1/4 PARSER] {err_msg}")
+                raise ValueError(err_msg)
 
             # 3. Trích xuất cấu trúc cây chương/mục
-            logger.info("Trích xuất cấu trúc chương/mục...")
+            logger.info("🌳 [2/4 STRUCTURE] Phân tích cấu trúc tiêu đề, chương, phần, mục...")
             chapter_tree = self.extractor.extract(parsed_doc)
 
             # 4. Xóa chapter cũ trước khi lưu mới (tránh trùng lặp khi re-process)
             existing_chapters = db.query(Chapter).filter(Chapter.document_id == document_id).all()
             if existing_chapters:
-                logger.info(f"Xóa {len(existing_chapters)} chapter cũ của tài liệu {document_id}")
+                logger.info(f"🌳 [2/4 STRUCTURE] Xóa {len(existing_chapters)} chapter cũ của tài liệu {document_id}")
                 db.query(Chapter).filter(Chapter.document_id == document_id).delete()
                 db.flush()
 
             # 5. Lưu cây chapter vào DB
-            logger.info("Lưu cây chương/mục vào cơ sở dữ liệu...")
             saved_count = self._save_chapters(document_id, chapter_tree, db, parent_id=None)
-            logger.info(f"Đã lưu thành công {saved_count} chương/mục.")
+            logger.info(f"🌳 [2/4 STRUCTURE] Đã lưu thành công {saved_count} chương/mục vào cơ sở dữ liệu.")
 
             # 6. Gọi ChunkingService và EmbeddingService để vector hóa (nếu có)
             try:
                 from app.services.chunking_service import ChunkingService
                 from app.services.embedding_service import EmbeddingService
 
-                logger.info("Khởi động dịch vụ Chunking & Embedding...")
+                logger.info("🧩 [3/4 VECTOR/RAG] Đang cắt nhỏ văn bản (Chunking) & tạo Vector Embeddings...")
                 chunking_service = ChunkingService()
                 embedding_service = EmbeddingService()
 
@@ -102,7 +115,8 @@ class DocumentProcessor:
                 elif hasattr(embedding_service, "embed_document"):
                     embedding_service.embed_document(document_id, db)
 
-                logger.info("Hoàn tất chunking và embedding vector.")
+                chunk_count = len(chunks) if chunks else "N/A"
+                logger.info(f"🧩 [3/4 VECTOR/RAG] Hoàn tất: Đã lưu {chunk_count} chunks vào ChromaDB.")
             except (ImportError, ModuleNotFoundError) as ie:
                 logger.warning(f"ChunkingService hoặc EmbeddingService chưa tồn tại hoặc chưa cài đặt đầy đủ: {ie}")
             except Exception as ve:
@@ -113,7 +127,10 @@ class DocumentProcessor:
             document.total_chapters = saved_count
             db.commit()
             db.refresh(document)
-            logger.info(f"Xử lý tài liệu ID {document_id} thành công! Status: READY, Chapters: {saved_count}")
+            logger.info(
+                f"🎉 [4/4 READY] Xử lý tài liệu ID={document_id} ('{document.original_filename}') THÀNH CÔNG 100%! "
+                f"Status: READY, Tổng số chương/mục: {saved_count}."
+            )
             return document
 
         except Exception as e:

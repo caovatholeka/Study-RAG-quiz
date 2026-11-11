@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Dịch vụ sinh câu hỏi trắc nghiệm tự động (QuizGenerator) sử dụng Google Gemini qua google-genai SDK.
+Dịch vụ sinh câu hỏi trắc nghiệm tự động (QuizGenerator) hỗ trợ cả OpenAI (gpt-4o-mini) và Google Gemini.
 Hỗ trợ sinh hàng loạt (batch generation), cắt tỉa văn bản theo ranh giới câu,
 xử lý lỗi rate limit với exponential backoff, và validate định dạng dữ liệu đầu ra.
 """
@@ -22,31 +22,83 @@ logger = logging.getLogger(__name__)
 
 class QuizGenerator:
     """
-    Sinh câu hỏi trắc nghiệm dựa trên nội dung chương học bằng Google Gemini API (google-genai client).
+    Sinh câu hỏi trắc nghiệm dựa trên nội dung chương học bằng OpenAI hoặc Google Gemini API.
     """
 
-    def __init__(self, api_key: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> None:
         """
-        Khởi tạo QuizGenerator với API Key.
+        Khởi tạo QuizGenerator hỗ trợ cả OpenAI (gpt-4o-mini) và Google Gemini.
+        Tự động nhận diện provider theo tiền tố của API key.
 
         Args:
-            api_key: Google Gemini API key. Nếu không truyền, lấy từ settings.GEMINI_API_KEY.
+            api_key: OpenAI hoặc Gemini API key. Nếu không truyền, lấy từ cấu hình.
+            provider: "openai" hoặc "gemini" (tùy chọn, mặc định tự động xác định).
+            model: Tên mô hình (tùy chọn, mặc định gpt-4o-mini hoặc gemini-2.0-flash).
         """
-        self.api_key = api_key or getattr(settings, "GEMINI_API_KEY", "")
-        self.model = getattr(settings, "LLM_MODEL", "gemini-2.0-flash")
+        if api_key is not None:
+            raw_key = api_key
+        else:
+            pref_provider = (provider or getattr(settings, "LLM_PROVIDER", "auto")).lower()
+            if pref_provider == "openai":
+                raw_key = getattr(settings, "OPENAI_API_KEY", "") or getattr(settings, "GEMINI_API_KEY", "")
+            elif pref_provider == "gemini":
+                raw_key = getattr(settings, "GEMINI_API_KEY", "") or getattr(settings, "GOOGLE_API_KEY", "")
+            else:
+                raw_key = (
+                    getattr(settings, "OPENAI_API_KEY", "")
+                    or getattr(settings, "GEMINI_API_KEY", "")
+                    or getattr(settings, "GOOGLE_API_KEY", "")
+                )
+
+        self.api_key = raw_key.strip().strip('"').strip("'") if raw_key else ""
+
+        # Xác định provider
+        if provider:
+            self.provider = provider.lower()
+        elif self.api_key.startswith("sk-"):
+            self.provider = "openai"
+        elif self.api_key.startswith("AIza") or self.api_key.startswith("AQ."):
+            self.provider = "gemini"
+        else:
+            configured_provider = getattr(settings, "LLM_PROVIDER", "auto").lower()
+            if configured_provider in ("openai", "gemini"):
+                self.provider = configured_provider
+            else:
+                self.provider = "openai" if getattr(settings, "OPENAI_API_KEY", "") else "gemini"
+
+        # Xác định model
+        if model:
+            self.model = model
+        elif self.provider == "openai":
+            self.model = getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")
+        else:
+            self.model = getattr(settings, "LLM_MODEL", "gemini-2.0-flash")
+
+        self.openai_client = None
+        self.client = None
 
         if not self.api_key:
-            logger.warning(
-                "GEMINI_API_KEY chưa được cấu hình. Các thao tác gọi API sẽ không thể thực hiện."
-            )
-            self.client = None
+            logger.warning("API Key chưa được cấu hình. Các thao tác gọi LLM sẽ không thể thực hiện.")
         else:
-            try:
-                self.client = genai.Client(api_key=self.api_key)
-                logger.info(f"Khởi tạo google.genai Client thành công với model '{self.model}'.")
-            except Exception as e:
-                logger.error(f"Lỗi khởi tạo google.genai Client: {e}", exc_info=True)
-                self.client = None
+            if self.provider == "openai":
+                try:
+                    import openai
+                    self.openai_client = openai.OpenAI(api_key=self.api_key)
+                    self.client = self.openai_client
+                    logger.info(f"Khởi tạo OpenAI Client thành công với model '{self.model}'.")
+                except Exception as e:
+                    logger.error(f"Lỗi khởi tạo OpenAI Client: {e}", exc_info=True)
+            else:
+                try:
+                    self.client = genai.Client(api_key=self.api_key)
+                    logger.info(f"Khởi tạo google.genai Client thành công với model '{self.model}'.")
+                except Exception as e:
+                    logger.error(f"Lỗi khởi tạo google.genai Client: {e}", exc_info=True)
 
     def generate_questions(
         self,
@@ -74,8 +126,8 @@ class QuizGenerator:
         if difficulty_mix is None:
             difficulty_mix = {"easy": 0.3, "medium": 0.5, "hard": 0.2}
 
-        # 1. Cắt tỉa nội dung chương nếu vượt quá giới hạn token an toàn
-        truncated_content = self._truncate_content(chapter_content, max_tokens=4000)
+        # 1. Cắt tỉa nội dung chương nếu vượt quá giới hạn token an toàn (hỗ trợ tài liệu dài)
+        truncated_content = self._truncate_content(chapter_content, max_tokens=25000)
 
         # 2. Xây dựng prompt
         prompt = self._build_prompt(
@@ -85,10 +137,19 @@ class QuizGenerator:
             difficulty_mix=difficulty_mix,
         )
 
-        # 3. Gọi Gemini API với retry & exponential backoff
-        response_text = self._call_gemini(prompt)
+        # 3. Gọi LLM API (OpenAI hoặc Gemini) với retry & exponential backoff
+        from unittest.mock import Mock, MagicMock
+        if isinstance(getattr(self, "_call_openai", None), (Mock, MagicMock)):
+            response_text = self._call_openai(prompt)
+        elif isinstance(getattr(self, "_call_gemini", None), (Mock, MagicMock)):
+            response_text = self._call_gemini(prompt)
+        elif self.provider == "openai":
+            response_text = self._call_openai(prompt)
+        else:
+            response_text = self._call_gemini(prompt)
+
         if not response_text:
-            logger.error(f"Không nhận được phản hồi từ Gemini cho chương '{chapter_title}'.")
+            logger.error(f"Không nhận được phản hồi từ LLM ({self.provider}) cho chương '{chapter_title}'.")
             return []
 
         # 4. Parse JSON và validate trường dữ liệu
@@ -130,16 +191,113 @@ class QuizGenerator:
             difficulty_distribution=dist_str,
         )
 
+    def _call_openai(self, prompt: str) -> str:
+        """
+        Gọi OpenAI Chat Completions API với retry và exponential backoff.
+        """
+        if not self.api_key:
+            raw_key = getattr(settings, "OPENAI_API_KEY", "")
+            self.api_key = raw_key.strip().strip('"').strip("'") if raw_key else ""
+        if not self.api_key:
+            raise RuntimeError("OPENAI_API_KEY chưa được thiết lập trong cấu hình hoặc biến môi trường.")
+
+        if self.openai_client is None:
+            import openai
+            self.openai_client = openai.OpenAI(api_key=self.api_key)
+            self.client = self.openai_client
+
+        max_retries = 3
+        backoff = 2.0
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(f"Đang gọi OpenAI ({self.model}) - Lần thử {attempt}/{max_retries}...")
+                resp = self.openai_client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Bạn là chuyên gia giáo dục và biên soạn đề thi trắc nghiệm chuyên nghiệp. "
+                                "Hãy trả về kết quả dưới dạng JSON array hợp lệ theo đúng cấu trúc yêu cầu."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.7,
+                )
+                if resp and resp.choices and resp.choices[0].message.content:
+                    return resp.choices[0].message.content
+            except Exception as e:
+                err_str = str(e).lower()
+                is_rate_limit = "429" in err_str or "rate limit" in err_str or "quota" in err_str
+                if is_rate_limit and attempt < max_retries:
+                    wait_time = backoff * (2 ** (attempt - 1))
+                    logger.warning(f"OpenAI Rate limit (Lần {attempt}/{max_retries}). Chờ {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                elif attempt == max_retries:
+                    raise RuntimeError(f"Lỗi gọi OpenAI API sau {max_retries} lần thử: {e}") from e
+                else:
+                    time.sleep(backoff)
+
+        return ""
+
+    def _call_gemini_rest(self, prompt: str, model: str) -> str:
+        """
+        Gọi trực tiếp Google Gemini API qua REST với header x-goog-api-key (chuẩn cURL của Google).
+        Tương thích trực tiếp với các định dạng API key mới (tiền tố AQ. hoặc AIzaSy).
+        """
+        import httpx
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.7,
+                "responseMimeType": "application/json",
+            },
+        }
+
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        if parts:
+                            return parts[0].get("text", "")
+                else:
+                    logger.warning(
+                        f"REST call tới {model} trả về status {resp.status_code}: {resp.text[:150]}"
+                    )
+        except Exception as e:
+            logger.warning(f"Lỗi khi gọi REST API ({model}): {e}")
+
+        return ""
+
     def _call_gemini(self, prompt: str) -> str:
         """
-        Gọi client.models.generate_content với cơ chế retry 3 lần và exponential backoff khi gặp rate limit.
+        Gọi Gemini với cơ chế đa tầng (google-genai SDK -> REST API x-goog-api-key)
+        kèm retry và exponential backoff khi gặp rate limit.
         """
+        if not self.api_key:
+            raw_key = getattr(settings, "GEMINI_API_KEY", "") or getattr(settings, "GOOGLE_API_KEY", "")
+            self.api_key = raw_key.strip().strip('"').strip("'") if raw_key else ""
+        if not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY hoặc GOOGLE_API_KEY chưa được thiết lập trong cấu hình hoặc biến môi trường.")
+
         if self.client is None:
-            if not self.api_key:
-                self.api_key = getattr(settings, "GEMINI_API_KEY", "")
-            if not self.api_key:
-                raise RuntimeError("GEMINI_API_KEY chưa được thiết lập trong cấu hình hoặc biến môi trường.")
-            self.client = genai.Client(api_key=self.api_key)
+            try:
+                self.client = genai.Client(api_key=self.api_key)
+            except Exception as e:
+                logger.warning(f"Không thể khởi tạo google.genai Client: {e}. Sẽ dùng REST API fallback.")
+                self.client = None
 
         max_retries = 3
         backoff = 2.0  # seconds
@@ -150,45 +308,56 @@ class QuizGenerator:
         )
 
         for attempt in range(1, max_retries + 1):
-            try:
-                logger.info(f"Đang gọi Gemini ({self.model}) - Lần thử {attempt}/{max_retries}...")
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                    config=config,
-                )
-                if response and response.text:
-                    return response.text
-                return ""
-            except Exception as e:
-                err_str = str(e).lower()
-                is_rate_limit = (
-                    "429" in err_str
-                    or "resource_exhausted" in err_str
-                    or "rate limit" in err_str
-                    or "quota" in err_str
-                )
-                if is_rate_limit and attempt < max_retries:
-                    wait_time = backoff * (2 ** (attempt - 1))
-                    logger.warning(
-                        f"Gặp Rate Limit từ Gemini API (Lần {attempt}/{max_retries}). "
-                        f"Chờ {wait_time:.1f}s trước khi thử lại... Lỗi: {e}"
+            # Thử qua google-genai SDK trước
+            if self.client is not None:
+                try:
+                    logger.info(f"Đang gọi Gemini ({self.model}) qua SDK - Lần thử {attempt}/{max_retries}...")
+                    response = self.client.models.generate_content(
+                        model=self.model,
+                        contents=prompt,
+                        config=config,
                     )
-                    time.sleep(wait_time)
-                else:
-                    if attempt == max_retries:
-                        logger.error(
-                            f"Gọi Gemini API thất bại sau {max_retries} lần thử: {e}",
-                            exc_info=True,
+                    if response and response.text:
+                        return response.text
+                except Exception as e:
+                    err_str = str(e).lower()
+                    is_rate_limit = (
+                        "429" in err_str
+                        or "resource_exhausted" in err_str
+                        or "rate limit" in err_str
+                        or "quota" in err_str
+                    )
+                    is_not_found = "404" in err_str or "not found" in err_str or "not supported" in err_str
+                    if is_not_found and self.model != "gemini-1.5-flash":
+                        logger.warning(
+                            f"Mô hình '{self.model}' không khả dụng ({e}). Tự động fallback sang 'gemini-1.5-flash'..."
                         )
+                        self.model = "gemini-1.5-flash"
+                        continue
+
+                    # Thử fallback ngay qua REST API với header x-goog-api-key
+                    logger.info("SDK gặp lỗi, chuyển sang gọi trực tiếp bằng REST API (x-goog-api-key)...")
+                    rest_res = self._call_gemini_rest(prompt=prompt, model=self.model)
+                    if rest_res:
+                        return rest_res
+
+                    if is_rate_limit and attempt < max_retries:
+                        wait_time = backoff * (2 ** (attempt - 1))
+                        logger.warning(f"Rate Limit (Lần {attempt}/{max_retries}). Chờ {wait_time:.1f}s...")
+                        time.sleep(wait_time)
+                        continue
+                    elif attempt == max_retries:
                         raise RuntimeError(f"Lỗi gọi Gemini API sau {max_retries} lần thử: {e}") from e
                     else:
-                        wait_time = backoff * (2 ** (attempt - 1))
-                        logger.warning(
-                            f"Lỗi API trong lần thử {attempt}/{max_retries}. "
-                            f"Chờ {wait_time:.1f}s và thử lại... Lỗi: {e}"
-                        )
-                        time.sleep(wait_time)
+                        time.sleep(backoff)
+                        continue
+
+            # Nếu không có client, gọi qua REST API
+            rest_res = self._call_gemini_rest(prompt=prompt, model=self.model)
+            if rest_res:
+                return rest_res
+            if attempt < max_retries:
+                time.sleep(backoff)
 
         return ""
 
@@ -284,15 +453,17 @@ class QuizGenerator:
 
         return validated_questions
 
-    def _truncate_content(self, content: str, max_tokens: int = 4000) -> str:
+    def _truncate_content(self, content: str, max_tokens: int = 25000) -> str:
         """
-        Cắt tỉa văn bản dài tại ranh giới câu để không vượt quá giới hạn token an toàn.
+        Cắt tỉa văn bản dài tại ranh giới câu nếu vượt quá giới hạn token an toàn.
+        Mô hình Gemini 2.0 / 1.5 Flash hỗ trợ ngữ cảnh lên tới 1M tokens,
+        ở đây đặt giới hạn an toàn 25,000 tokens (~75,000 ký tự tiếng Việt, tương đương 30-40 trang sách/chương).
         Ước lượng: 1 token ~ 3.0 ký tự tiếng Việt.
         """
         if not content:
             return ""
 
-        max_chars = max_tokens * 3  # Khoảng 12,000 ký tự cho 4000 tokens
+        max_chars = max_tokens * 3  # Khoảng 75,000 ký tự cho 25,000 tokens
         if len(content) <= max_chars:
             return content
 

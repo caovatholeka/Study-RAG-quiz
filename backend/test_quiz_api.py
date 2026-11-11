@@ -45,6 +45,9 @@ class TestQuizAPI(unittest.TestCase):
             finally:
                 db.close()
 
+        from app.config import settings
+        settings.GEMINI_API_KEY = "mock_test_key"
+
         app.dependency_overrides[get_db] = override_get_db
         cls.client = TestClient(app)
 

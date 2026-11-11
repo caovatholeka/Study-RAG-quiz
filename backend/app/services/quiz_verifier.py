@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 class QuizVerifier:
     """
     Xác thực câu hỏi và đáp án quiz theo quy trình 3 bước đảm bảo độ chính xác theo tài liệu nguồn.
+    Hỗ trợ cả OpenAI (gpt-4o-mini) và Google Gemini.
     """
 
     def __init__(
@@ -35,6 +36,8 @@ class QuizVerifier:
         rag_service: RAGService,
         embedding_service: EmbeddingService,
         api_key: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> None:
         """
         Khởi tạo QuizVerifier.
@@ -42,25 +45,72 @@ class QuizVerifier:
         Args:
             rag_service: Instance của RAGService để truy xuất ngữ cảnh.
             embedding_service: Instance của EmbeddingService.
-            api_key: Gemini API key. Mặc định lấy từ settings.GEMINI_API_KEY.
+            api_key: OpenAI hoặc Gemini API key. Mặc định lấy từ settings.
+            provider: "openai" hoặc "gemini" (tùy chọn, mặc định tự động nhận diện).
+            model: Tên mô hình LLM kiểm định.
         """
         self.rag_service = rag_service
         self.embedding_service = embedding_service
-        self.api_key = api_key or getattr(settings, "GEMINI_API_KEY", "")
-        self.model = getattr(settings, "LLM_MODEL", "gemini-2.0-flash")
+
+        if api_key is not None:
+            raw_key = api_key
+        else:
+            pref_provider = (provider or getattr(settings, "LLM_PROVIDER", "auto")).lower()
+            if pref_provider == "openai":
+                raw_key = getattr(settings, "OPENAI_API_KEY", "") or getattr(settings, "GEMINI_API_KEY", "")
+            elif pref_provider == "gemini":
+                raw_key = getattr(settings, "GEMINI_API_KEY", "") or getattr(settings, "GOOGLE_API_KEY", "")
+            else:
+                raw_key = (
+                    getattr(settings, "OPENAI_API_KEY", "")
+                    or getattr(settings, "GEMINI_API_KEY", "")
+                    or getattr(settings, "GOOGLE_API_KEY", "")
+                )
+
+        self.api_key = raw_key.strip().strip('"').strip("'") if raw_key else ""
+
+        if provider:
+            self.provider = provider.lower()
+        elif self.api_key.startswith("sk-"):
+            self.provider = "openai"
+        elif self.api_key.startswith("AIza") or self.api_key.startswith("AQ."):
+            self.provider = "gemini"
+        else:
+            configured_provider = getattr(settings, "LLM_PROVIDER", "auto").lower()
+            if configured_provider in ("openai", "gemini"):
+                self.provider = configured_provider
+            else:
+                self.provider = "openai" if getattr(settings, "OPENAI_API_KEY", "") else "gemini"
+
+        if model:
+            self.model = model
+        elif self.provider == "openai":
+            self.model = getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")
+        else:
+            self.model = getattr(settings, "LLM_MODEL", "gemini-2.0-flash")
+
+        self.openai_client = None
+        self.client = None
 
         if not self.api_key:
             logger.warning(
-                "GEMINI_API_KEY chưa được cấu hình. Bước 3 LLM verification sẽ fallback."
+                "API Key chưa được cấu hình. Bước 3 LLM verification sẽ fallback."
             )
-            self.client = None
         else:
-            try:
-                self.client = genai.Client(api_key=self.api_key)
-                logger.info(f"QuizVerifier khởi tạo google.genai Client với model '{self.model}'.")
-            except Exception as e:
-                logger.error(f"Lỗi khởi tạo Gemini Client trong QuizVerifier: {e}", exc_info=True)
-                self.client = None
+            if self.provider == "openai":
+                try:
+                    import openai
+                    self.openai_client = openai.OpenAI(api_key=self.api_key)
+                    self.client = self.openai_client
+                    logger.info(f"QuizVerifier khởi tạo OpenAI Client với model '{self.model}'.")
+                except Exception as e:
+                    logger.error(f"Lỗi khởi tạo OpenAI Client trong QuizVerifier: {e}", exc_info=True)
+            else:
+                try:
+                    self.client = genai.Client(api_key=self.api_key)
+                    logger.info(f"QuizVerifier khởi tạo google.genai Client với model '{self.model}'.")
+                except Exception as e:
+                    logger.error(f"Lỗi khởi tạo Gemini Client trong QuizVerifier: {e}", exc_info=True)
 
     def verify_questions(
         self,
@@ -224,28 +274,53 @@ class QuizVerifier:
             logger.error(f"Lỗi tính fuzzy ratio: {e}")
             return 0.0
 
+    def _call_gemini_rest(self, prompt: str, model: str) -> str:
+        """
+        Gọi trực tiếp Google Gemini qua REST API với header x-goog-api-key.
+        """
+        import httpx
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.2,
+                "responseMimeType": "application/json",
+            },
+        }
+
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        if parts:
+                            return parts[0].get("text", "")
+        except Exception as e:
+            logger.warning(f"QuizVerifier REST call lỗi: {e}")
+
+        return ""
+
     def _llm_verify(self, question: Dict[str, Any], source_context: str) -> Dict[str, Any]:
         """
-        Gọi Google Gemini để kiểm định câu hỏi và đáp án dựa trên QUIZ_VERIFICATION_PROMPT.
-
-        Args:
-            question: Dict chứa câu hỏi và các phương án.
-            source_context: Chuỗi ngữ cảnh tài liệu kèm trích dẫn nguồn.
-
-        Returns:
-            Dict[str, Any]: {"is_valid": bool, "verdict": "YES"/"NO", "correct_answer": str, "explanation": str}.
+        Gọi OpenAI hoặc Google Gemini để kiểm định câu hỏi và đáp án dựa trên QUIZ_VERIFICATION_PROMPT.
         """
-        if self.client is None:
-            if not self.api_key:
-                self.api_key = getattr(settings, "GEMINI_API_KEY", "")
-            if not self.api_key:
-                logger.warning("Không có GEMINI_API_KEY để thực hiện _llm_verify.")
-                return {"is_valid": False, "verdict": "NO", "correct_answer": "", "explanation": "Không có API key."}
-            try:
-                self.client = genai.Client(api_key=self.api_key)
-            except Exception as e:
-                logger.error(f"Không thể khởi tạo Gemini Client trong _llm_verify: {e}")
-                return {"is_valid": False, "verdict": "NO", "correct_answer": "", "explanation": str(e)}
+        if not self.api_key:
+            if self.provider == "openai":
+                raw_key = getattr(settings, "OPENAI_API_KEY", "")
+            else:
+                raw_key = getattr(settings, "GEMINI_API_KEY", "") or getattr(settings, "GOOGLE_API_KEY", "")
+            self.api_key = raw_key.strip().strip('"').strip("'") if raw_key else ""
+        if not self.api_key:
+            logger.warning("Không có API key để thực hiện _llm_verify.")
+            return {"is_valid": False, "verdict": "NO", "correct_answer": "", "explanation": "Không có API key."}
 
         q_text = str(question.get("question") or "")
         options = question.get("options", {})
@@ -262,46 +337,102 @@ class QuizVerifier:
             correct_answer=full_correct_info,
         )
 
-        config = types.GenerateContentConfig(
-            temperature=0.2,  # Nhiệt độ thấp cho tác vụ kiểm định chính xác
-            response_mime_type="application/json",
-        )
-
         max_retries = 3
         backoff = 2.0
 
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                    config=config,
-                )
-                if response and response.text:
-                    return self._parse_llm_verification_response(response.text, default_letter=correct_letter)
-                return {"is_valid": False, "verdict": "NO", "correct_answer": correct_letter, "explanation": "Rỗng."}
-            except Exception as e:
-                err_str = str(e).lower()
-                is_rate_limit = (
-                    "429" in err_str
-                    or "resource_exhausted" in err_str
-                    or "rate limit" in err_str
-                    or "quota" in err_str
-                )
-                if is_rate_limit and attempt < max_retries:
-                    wait_time = backoff * (2 ** (attempt - 1))
-                    logger.warning(f"Rate limit khi verify câu hỏi. Thử lại sau {wait_time:.1f}s...")
-                    time.sleep(wait_time)
-                else:
-                    if attempt == max_retries:
-                        logger.error(f"_llm_verify thất bại sau {max_retries} lần: {e}")
+        # Nếu là OpenAI
+        if self.provider == "openai":
+            if self.openai_client is None:
+                import openai
+                self.openai_client = openai.OpenAI(api_key=self.api_key)
+                self.client = self.openai_client
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    resp = self.openai_client.chat.completions.create(
+                        model=self.model,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "Bạn là chuyên gia kiểm định chất lượng đề thi. Chỉ trả về DUY NHẤT một JSON object hợp lệ.",
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.2,
+                    )
+                    if resp and resp.choices and resp.choices[0].message.content:
+                        return self._parse_llm_verification_response(
+                            resp.choices[0].message.content, default_letter=correct_letter
+                        )
+                except Exception as e:
+                    logger.warning(f"Lỗi OpenAI verification (Lần {attempt}/{max_retries}): {e}")
+                    if attempt < max_retries:
+                        time.sleep(backoff * (2 ** (attempt - 1)))
+                    else:
                         return {
                             "is_valid": False,
                             "verdict": "NO",
                             "correct_answer": correct_letter,
-                            "explanation": f"Lỗi gọi LLM: {e}",
+                            "explanation": f"Lỗi gọi OpenAI: {e}",
                         }
-                    time.sleep(backoff)
+
+            return {"is_valid": False, "verdict": "NO", "correct_answer": correct_letter, "explanation": "Thất bại."}
+
+        # Nếu là Google Gemini
+        if self.client is None:
+            try:
+                self.client = genai.Client(api_key=self.api_key)
+            except Exception as e:
+                logger.warning(f"QuizVerifier: Không thể khởi tạo SDK client: {e}. Dùng REST API.")
+                self.client = None
+
+        config = types.GenerateContentConfig(
+            temperature=0.2,
+            response_mime_type="application/json",
+        )
+
+        for attempt in range(1, max_retries + 1):
+            if self.client is not None:
+                try:
+                    response = self.client.models.generate_content(
+                        model=self.model,
+                        contents=prompt,
+                        config=config,
+                    )
+                    if response and response.text:
+                        return self._parse_llm_verification_response(response.text, default_letter=correct_letter)
+                except Exception as e:
+                    err_str = str(e).lower()
+                    is_rate_limit = (
+                        "429" in err_str
+                        or "resource_exhausted" in err_str
+                        or "rate limit" in err_str
+                        or "quota" in err_str
+                    )
+                    is_not_found = "404" in err_str or "not found" in err_str or "not supported" in err_str
+                    if is_not_found and self.model != "gemini-1.5-flash":
+                        self.model = "gemini-1.5-flash"
+                        continue
+
+                    # Thử fallback qua REST API
+                    rest_text = self._call_gemini_rest(prompt=prompt, model=self.model)
+                    if rest_text:
+                        return self._parse_llm_verification_response(rest_text, default_letter=correct_letter)
+
+                    if is_rate_limit and attempt < max_retries:
+                        time.sleep(backoff * (2 ** (attempt - 1)))
+                        continue
+                    elif attempt == max_retries:
+                        return {"is_valid": False, "verdict": "NO", "correct_answer": correct_letter, "explanation": f"Lỗi gọi LLM: {e}"}
+                    else:
+                        time.sleep(backoff)
+                        continue
+
+            rest_text = self._call_gemini_rest(prompt=prompt, model=self.model)
+            if rest_text:
+                return self._parse_llm_verification_response(rest_text, default_letter=correct_letter)
+            if attempt < max_retries:
+                time.sleep(backoff)
 
         return {"is_valid": False, "verdict": "NO", "correct_answer": correct_letter, "explanation": "Thất bại."}
 
